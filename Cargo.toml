@@ -11,4 +11,8 @@ keywords = ["strings", "shell", "variables"]
 
 [dependencies]
 dirs = "2.0"
+libc = {version = "*", optional = true}
 
+[features]
+default = ["users"]
+users = ["libc"]

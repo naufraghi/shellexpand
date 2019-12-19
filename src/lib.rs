@@ -87,14 +87,83 @@
 //!
 //! The above example also demonstrates the flexibility of context function signatures: the context
 //! function may return anything which can be `AsRef`ed into a string slice.
-
 extern crate dirs;
-
+#[cfg(all(unix, feature = "users"))]
+extern crate libc;
+#[cfg(all(unix, feature = "users"))]
+use libc::getpwnam;
 use std::borrow::Cow;
 use std::env::VarError;
 use std::error::Error;
+#[cfg(all(unix, feature = "users"))]
+use std::ffi::{CStr, CString, NulError};
 use std::fmt;
+#[cfg(all(unix, feature = "users"))]
 use std::path::Path;
+
+#[cfg(all(unix, feature = "users"))]
+type HomedirResult = Result<Option<String>, UsernameError<NulError>>;
+
+/// Matches exising user names
+///
+/// Used to resolve `~username` syntax, may fail if the username contains a null with
+/// `NulError`. Otherwise will return a `String` with the user dir (not checked to be a
+/// valid path) or `None` if there is no matching username.
+#[cfg(all(unix, feature = "users"))]
+pub fn username_homedir(name: &str) -> HomedirResult {
+    let cname = CString::new(name).map_err(|e| UsernameError {
+        username: name.into(),
+        cause: e,
+    })?;
+    fn get_dir_from_username(cname: CString) -> Option<String> {
+        let pwd = unsafe { getpwnam(cname.as_ptr()) };
+        if pwd.is_null() {
+            None
+        } else {
+            let dir = unsafe {
+                let pwd = *pwd; // already checked to be not null
+                CStr::from_ptr(pwd.pw_dir).to_string_lossy().into_owned()
+            };
+            Some(dir)
+        }
+    }
+    Ok(get_dir_from_username(cname))
+}
+
+/// Represents a username lookup error.
+///
+/// This error is returned by `username_homedir()` function. The original error is
+/// provided in the `cause` field, while `username` contains the name of a user whose
+/// lookup caused the error.
+#[cfg(all(unix, feature = "users"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsernameError<E> {
+    /// The name of the problematic username.
+    pub username: String,
+    /// The original error returned by the lookup function.
+    pub cause: E,
+}
+
+#[cfg(all(unix, feature = "users"))]
+impl<E: fmt::Display> fmt::Display for UsernameError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "error looking user '{}' up: {}",
+            self.username, self.cause
+        )
+    }
+}
+
+#[cfg(all(unix, feature = "users"))]
+impl<E: Error> Error for UsernameError<E> {
+    fn description(&self) -> &str {
+        "Homedir lookup error"
+    }
+    fn cause(&self) -> Option<&Error> {
+        Some(&self.cause)
+    }
+}
 
 /// Performs both tilde and environment expansion using the provided contexts.
 ///
@@ -689,6 +758,52 @@ where
     }
 }
 
+/// Performs tilde expansion considering ~otheruser syntax too.
+///
+/// This function depends on the "users" feature.
+///
+#[cfg(all(unix, feature = "users"))]
+pub fn tilde_with_context_and_users<SI: ?Sized, P, HD, UD>(
+    input: &SI,
+    home_dir: HD,
+    user_dirs: UD,
+) -> Cow<str>
+where
+    SI: AsRef<str>,
+    P: AsRef<Path>,
+    HD: FnOnce() -> Option<P>,
+    UD: FnOnce(&str) -> HomedirResult,
+{
+    let input_str = input.as_ref();
+    if input_str.starts_with("~") {
+        let input_after_tilde = &input_str[1..];
+        if input_after_tilde.is_empty() || input_after_tilde.starts_with("/") {
+            if let Some(hd) = home_dir() {
+                let result = format!("{}{}", hd.as_ref().display(), input_after_tilde);
+                result.into()
+            } else {
+                // home dir is not available
+                input_str.into()
+            }
+        } else {
+            // here we handle `~otheruser/` paths
+            let (username, input_after_username) = if let Some(idx) = input_after_tilde.find("/") {
+                (&input_after_tilde[..idx], &input_after_tilde[idx..])
+            } else {
+                (input_after_tilde, "")
+            };
+            if let Ok(Some(homedir)) = user_dirs(username) {
+                let result = format!("{}{}", homedir, input_after_username);
+                result.into()
+            } else {
+                input_str.into()
+            }
+        }
+    } else {
+        // input doesn't start with tilde
+        input_str.into()
+    }
+}
 /// Performs the tilde expansion using the default system context.
 ///
 /// This function delegates to `tilde_with_context()`, using the default system source of home
@@ -722,6 +837,9 @@ mod tilde_tests {
 
     use super::{tilde, tilde_with_context};
 
+    #[cfg(all(unix, feature = "users"))]
+    use super::{tilde_with_context_and_users, HomedirResult};
+
     #[test]
     fn test_with_tilde_no_hd() {
         fn hd() -> Option<PathBuf> {
@@ -746,6 +864,58 @@ mod tilde_tests {
         assert_eq!(tilde_with_context("~", hd), "/home/dir");
         assert_eq!(tilde_with_context("~/path", hd), "/home/dir/path");
         assert_eq!(tilde_with_context("~whatever/path", hd), "~whatever/path");
+    }
+
+    #[cfg(all(unix, feature = "users"))]
+    #[test]
+    fn test_with_tilde_and_username() {
+        fn hd() -> Option<PathBuf> {
+            Some(Path::new("/home/dir").into())
+        }
+        fn ud(name: &str) -> HomedirResult {
+            if name == "other" {
+                Ok(Some("/home/other".into()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        // Nothing changed for unknown users
+        assert_eq!(
+            tilde_with_context_and_users("whatever/path", hd, ud),
+            "whatever/path"
+        );
+        assert_eq!(
+            tilde_with_context_and_users("whatever/~/path", hd, ud),
+            "whatever/~/path"
+        );
+        assert_eq!(tilde_with_context_and_users("~", hd, ud), "/home/dir");
+        assert_eq!(
+            tilde_with_context_and_users("~/path", hd, ud),
+            "/home/dir/path"
+        );
+        assert_eq!(
+            tilde_with_context_and_users("~whatever/path", hd, ud),
+            "~whatever/path"
+        );
+        // Known users are expanded in the right places
+        assert_eq!(
+            tilde_with_context_and_users("other/path", hd, ud),
+            "other/path"
+        );
+        assert_eq!(
+            tilde_with_context_and_users("other/~/path", hd, ud),
+            "other/~/path"
+        );
+        assert_eq!(tilde_with_context_and_users("~", hd, ud), "/home/dir");
+        assert_eq!(
+            tilde_with_context_and_users("~/path", hd, ud),
+            "/home/dir/path"
+        );
+        assert_eq!(
+            tilde_with_context_and_users("~other/path", hd, ud),
+            "/home/other/path"
+        );
     }
 
     #[test]
