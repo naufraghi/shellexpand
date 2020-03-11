@@ -88,23 +88,25 @@
 //! The above example also demonstrates the flexibility of context function signatures: the context
 //! function may return anything which can be `AsRef`ed into a string slice.
 extern crate dirs;
-#[cfg(all(unix, feature = "users"))]
 extern crate libc;
-#[cfg(all(unix, feature = "users"))]
-use libc::getpwnam;
+
 use std::borrow::Cow;
 use std::env::VarError;
 use std::error::Error;
+
 #[cfg(all(unix, feature = "users"))]
-use std::ffi::{CStr, CString, NulError};
+use {
+    std::ffi::{CStr, CString, NulError, OsString},
+    std::os::unix::ffi::OsStringExt,
+    std::path::Path,
+};
+
 use std::fmt;
-#[cfg(all(unix, feature = "users"))]
-use std::path::Path;
 
 #[cfg(all(unix, feature = "users"))]
 type HomedirResult = Result<Option<String>, UsernameError<NulError>>;
 
-/// Matches exising user names
+/// Matches existing user names
 ///
 /// Used to resolve `~username` syntax, may fail if the username contains a null with
 /// `NulError`. Otherwise will return a `String` with the user dir (not checked to be a
@@ -115,19 +117,38 @@ pub fn username_homedir(name: &str) -> HomedirResult {
         username: name.into(),
         cause: e,
     })?;
-    fn get_dir_from_username(cname: CString) -> Option<String> {
-        let pwd = unsafe { getpwnam(cname.as_ptr()) };
-        if pwd.is_null() {
-            None
-        } else {
-            let dir = unsafe {
-                let pwd = *pwd; // already checked to be not null
-                CStr::from_ptr(pwd.pw_dir).to_string_lossy().into_owned()
-            };
-            Some(dir)
+    unsafe fn get_dir_from_username(cname: CString) -> Option<String> {
+        use std::mem;
+        use std::ptr;
+        // Almost verbatim copy from dirs-sys, except for calling `getpwnam_r` instead of `getpwuid_r`.
+        let amt = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            n if n < 0 => 512 as usize,
+            n => n as usize,
+        };
+        let mut buf = Vec::with_capacity(amt);
+        let mut passwd: libc::passwd = mem::zeroed();
+        let mut result = ptr::null_mut();
+        match libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut passwd,
+            buf.as_mut_ptr(),
+            buf.capacity(),
+            &mut result,
+        ) {
+            0 if !result.is_null() => {
+                let ptr = passwd.pw_dir as *const _;
+                let bytes = CStr::from_ptr(ptr).to_bytes();
+                if bytes.is_empty() {
+                    None
+                } else {
+                    let os_string: OsString = OsStringExt::from_vec(bytes.to_vec());
+                    os_string.into_string().ok()
+                }
+            }
+            _ => None,
         }
     }
-    Ok(get_dir_from_username(cname))
+    Ok(unsafe { get_dir_from_username(cname) })
 }
 
 /// Represents a username lookup error.
@@ -149,7 +170,7 @@ impl<E: fmt::Display> fmt::Display for UsernameError<E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "error looking user '{}' up: {}",
+            "error looking-up user '{}': {}",
             self.username, self.cause
         )
     }
@@ -160,7 +181,7 @@ impl<E: Error> Error for UsernameError<E> {
     fn description(&self) -> &str {
         "Homedir lookup error"
     }
-    fn cause(&self) -> Option<&Error> {
+    fn cause(&self) -> Option<&dyn Error> {
         Some(&self.cause)
     }
 }
@@ -775,9 +796,9 @@ where
     UD: FnOnce(&str) -> HomedirResult,
 {
     let input_str = input.as_ref();
-    if input_str.starts_with("~") {
+    if input_str.starts_with('~') {
         let input_after_tilde = &input_str[1..];
-        if input_after_tilde.is_empty() || input_after_tilde.starts_with("/") {
+        if input_after_tilde.is_empty() || input_after_tilde.starts_with('/') {
             if let Some(hd) = home_dir() {
                 let result = format!("{}{}", hd.as_ref().display(), input_after_tilde);
                 result.into()
@@ -787,7 +808,7 @@ where
             }
         } else {
             // here we handle `~otheruser/` paths
-            let (username, input_after_username) = if let Some(idx) = input_after_tilde.find("/") {
+            let (username, input_after_username) = if let Some(idx) = input_after_tilde.find('/') {
                 (&input_after_tilde[..idx], &input_after_tilde[idx..])
             } else {
                 (input_after_tilde, "")
